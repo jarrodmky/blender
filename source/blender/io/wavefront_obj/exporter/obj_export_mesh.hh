@@ -130,11 +130,6 @@ class OBJMesh : NonCopyable {
    * Return mat_nr-th material of the object. The given index should be zero-based.
    */
   const Material *get_object_material(int16_t mat_nr) const;
-  /**
-   * Returns a zero-based index of a polygon's material indexing into
-   * the Object's material slots.
-   */
-  int16_t ith_poly_matnr(int poly_index) const;
 
   void ensure_mesh_normals() const;
   void ensure_mesh_edges() const;
@@ -166,7 +161,7 @@ class OBJMesh : NonCopyable {
   /**
    * Calculate coordinates of the vertex at the given index.
    */
-  float3 calc_vertex_coords(int vert_index, float scaling_factor) const;
+  float3 calc_vertex_coords(int vert_index, float global_scale) const;
   /**
    * Calculate vertex indices of all vertices of the polygon at the given index.
    */
@@ -241,6 +236,11 @@ class OBJMesh : NonCopyable {
     return i < 0 || i >= poly_order_.size() ? i : poly_order_[i];
   }
 
+  Mesh *get_mesh() const
+  {
+    return export_mesh_eval_;
+  }
+
  private:
   /**
    * Free the mesh if _the exporter_ created it.
@@ -256,6 +256,6 @@ class OBJMesh : NonCopyable {
   /**
    * Set the final transform after applying axes settings and an Object's world transform.
    */
-  void set_world_axes_transform(eTransformAxisForward forward, eTransformAxisUp up);
+  void set_world_axes_transform(eIOAxis forward, eIOAxis up);
 };
 }  // namespace blender::io::obj

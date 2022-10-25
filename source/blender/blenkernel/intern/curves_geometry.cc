@@ -9,15 +9,18 @@
 
 #include "MEM_guardedalloc.h"
 
+#include "BLI_array_utils.hh"
 #include "BLI_bounds.hh"
 #include "BLI_index_mask_ops.hh"
 #include "BLI_length_parameterize.hh"
 #include "BLI_math_rotation.hh"
+#include "BLI_task.hh"
 
 #include "DNA_curves_types.h"
 
 #include "BKE_attribute_math.hh"
 #include "BKE_curves.hh"
+#include "BKE_curves_utils.hh"
 
 namespace blender::bke {
 
@@ -35,8 +38,9 @@ static const std::string ATTR_HANDLE_POSITION_RIGHT = "handle_right";
 static const std::string ATTR_NURBS_ORDER = "nurbs_order";
 static const std::string ATTR_NURBS_WEIGHT = "nurbs_weight";
 static const std::string ATTR_NURBS_KNOTS_MODE = "knots_mode";
-static const std::string ATTR_SURFACE_TRIANGLE_INDEX = "surface_triangle_index";
-static const std::string ATTR_SURFACE_TRIANGLE_COORDINATE = "surface_triangle_coordinate";
+static const std::string ATTR_SELECTION_POINT_FLOAT = ".selection_point_float";
+static const std::string ATTR_SELECTION_CURVE_FLOAT = ".selection_curve_float";
+static const std::string ATTR_SURFACE_UV_COORDINATE = "surface_uv_coordinate";
 
 /* -------------------------------------------------------------------- */
 /** \name Constructors/Destructor
@@ -55,14 +59,16 @@ CurvesGeometry::CurvesGeometry(const int point_num, const int curve_num)
 
   CustomData_add_layer_named(&this->point_data,
                              CD_PROP_FLOAT3,
-                             CD_DEFAULT,
+                             CD_CONSTRUCT,
                              nullptr,
                              this->point_num,
                              ATTR_POSITION.c_str());
 
-  this->curve_offsets = (int *)MEM_calloc_arrayN(this->curve_num + 1, sizeof(int), __func__);
-
-  this->update_customdata_pointers();
+  this->curve_offsets = (int *)MEM_malloc_arrayN(this->curve_num + 1, sizeof(int), __func__);
+#ifdef DEBUG
+  this->offsets_for_write().fill(-1);
+#endif
+  this->offsets_for_write().first() = 0;
 
   this->runtime = MEM_new<CurvesGeometryRuntime>(__func__);
   /* Fill the type counts with the default so they're in a valid state. */
@@ -82,15 +88,13 @@ static void copy_curves_geometry(CurvesGeometry &dst, const CurvesGeometry &src)
   CustomData_copy(&src.curve_data, &dst.curve_data, CD_MASK_ALL, CD_DUPLICATE, dst.curve_num);
 
   MEM_SAFE_FREE(dst.curve_offsets);
-  dst.curve_offsets = (int *)MEM_calloc_arrayN(dst.point_num + 1, sizeof(int), __func__);
+  dst.curve_offsets = (int *)MEM_malloc_arrayN(dst.point_num + 1, sizeof(int), __func__);
   dst.offsets_for_write().copy_from(src.offsets());
 
   dst.tag_topology_changed();
 
   /* Though type counts are a cache, they must be copied because they are calculated eagerly. */
   dst.runtime->type_counts = src.runtime->type_counts;
-
-  dst.update_customdata_pointers();
 }
 
 CurvesGeometry::CurvesGeometry(const CurvesGeometry &other)
@@ -124,9 +128,6 @@ static void move_curves_geometry(CurvesGeometry &dst, CurvesGeometry &src)
   MEM_SAFE_FREE(src.curve_offsets);
 
   std::swap(dst.runtime, src.runtime);
-
-  src.update_customdata_pointers();
-  dst.update_customdata_pointers();
 }
 
 CurvesGeometry::CurvesGeometry(CurvesGeometry &&other)
@@ -158,30 +159,29 @@ CurvesGeometry::~CurvesGeometry()
 /** \name Accessors
  * \{ */
 
-static int domain_num(const CurvesGeometry &curves, const AttributeDomain domain)
+static int domain_num(const CurvesGeometry &curves, const eAttrDomain domain)
 {
   return domain == ATTR_DOMAIN_POINT ? curves.points_num() : curves.curves_num();
 }
 
-static CustomData &domain_custom_data(CurvesGeometry &curves, const AttributeDomain domain)
+static CustomData &domain_custom_data(CurvesGeometry &curves, const eAttrDomain domain)
 {
   return domain == ATTR_DOMAIN_POINT ? curves.point_data : curves.curve_data;
 }
 
-static const CustomData &domain_custom_data(const CurvesGeometry &curves,
-                                            const AttributeDomain domain)
+static const CustomData &domain_custom_data(const CurvesGeometry &curves, const eAttrDomain domain)
 {
   return domain == ATTR_DOMAIN_POINT ? curves.point_data : curves.curve_data;
 }
 
 template<typename T>
 static VArray<T> get_varray_attribute(const CurvesGeometry &curves,
-                                      const AttributeDomain domain,
+                                      const eAttrDomain domain,
                                       const StringRefNull name,
                                       const T default_value)
 {
   const int num = domain_num(curves, domain);
-  const CustomDataType type = cpp_type_to_custom_data_type(CPPType::get<T>());
+  const eCustomDataType type = cpp_type_to_custom_data_type(CPPType::get<T>());
   const CustomData &custom_data = domain_custom_data(curves, domain);
 
   const T *data = (const T *)CustomData_get_layer_named(&custom_data, type, name.c_str());
@@ -193,12 +193,12 @@ static VArray<T> get_varray_attribute(const CurvesGeometry &curves,
 
 template<typename T>
 static Span<T> get_span_attribute(const CurvesGeometry &curves,
-                                  const AttributeDomain domain,
+                                  const eAttrDomain domain,
                                   const StringRefNull name)
 {
   const int num = domain_num(curves, domain);
   const CustomData &custom_data = domain_custom_data(curves, domain);
-  const CustomDataType type = cpp_type_to_custom_data_type(CPPType::get<T>());
+  const eCustomDataType type = cpp_type_to_custom_data_type(CPPType::get<T>());
 
   T *data = (T *)CustomData_get_layer_named(&custom_data, type, name.c_str());
   if (data == nullptr) {
@@ -209,12 +209,12 @@ static Span<T> get_span_attribute(const CurvesGeometry &curves,
 
 template<typename T>
 static MutableSpan<T> get_mutable_attribute(CurvesGeometry &curves,
-                                            const AttributeDomain domain,
+                                            const eAttrDomain domain,
                                             const StringRefNull name,
                                             const T default_value = T())
 {
   const int num = domain_num(curves, domain);
-  const CustomDataType type = cpp_type_to_custom_data_type(CPPType::get<T>());
+  const eCustomDataType type = cpp_type_to_custom_data_type(CPPType::get<T>());
   CustomData &custom_data = domain_custom_data(curves, domain);
 
   T *data = (T *)CustomData_duplicate_referenced_layer_named(
@@ -223,7 +223,7 @@ static MutableSpan<T> get_mutable_attribute(CurvesGeometry &curves,
     return {data, num};
   }
   data = (T *)CustomData_add_layer_named(
-      &custom_data, type, CD_CALLOC, nullptr, num, name.c_str());
+      &custom_data, type, CD_SET_DEFAULT, nullptr, num, name.c_str());
   MutableSpan<T> span = {data, num};
   if (num > 0 && span.first() != default_value) {
     span.fill(default_value);
@@ -255,6 +255,12 @@ void CurvesGeometry::fill_curve_types(const IndexMask selection, const CurveType
   if (selection.size() == this->curves_num()) {
     this->fill_curve_types(type);
     return;
+  }
+  if (std::optional<int8_t> single_type = this->curve_types().get_if_single()) {
+    if (single_type == type) {
+      /* No need for an array if the types are already a single with the correct type. */
+      return;
+    }
   }
   /* A potential performance optimization is only counting the changed indices. */
   this->curve_types_for_write().fill_indices(selection, type);
@@ -301,13 +307,11 @@ void CurvesGeometry::update_curve_types()
 
 Span<float3> CurvesGeometry::positions() const
 {
-  return {(const float3 *)this->position, this->point_num};
+  return get_span_attribute<float3>(*this, ATTR_DOMAIN_POINT, ATTR_POSITION);
 }
 MutableSpan<float3> CurvesGeometry::positions_for_write()
 {
-  this->position = (float(*)[3])CustomData_duplicate_referenced_layer_named(
-      &this->point_data, CD_PROP_FLOAT3, ATTR_POSITION.c_str(), this->point_num);
-  return {(float3 *)this->position, this->point_num};
+  return get_mutable_attribute<float3>(*this, ATTR_DOMAIN_POINT, ATTR_POSITION);
 }
 
 Span<int> CurvesGeometry::offsets() const
@@ -418,24 +422,34 @@ MutableSpan<int8_t> CurvesGeometry::nurbs_knots_modes_for_write()
   return get_mutable_attribute<int8_t>(*this, ATTR_DOMAIN_CURVE, ATTR_NURBS_KNOTS_MODE, 0);
 }
 
-VArray<int> CurvesGeometry::surface_triangle_indices() const
+Span<float2> CurvesGeometry::surface_uv_coords() const
 {
-  return get_varray_attribute<int>(*this, ATTR_DOMAIN_CURVE, ATTR_SURFACE_TRIANGLE_INDEX, -1);
+  return get_span_attribute<float2>(*this, ATTR_DOMAIN_CURVE, ATTR_SURFACE_UV_COORDINATE);
 }
 
-MutableSpan<int> CurvesGeometry::surface_triangle_indices_for_write()
+MutableSpan<float2> CurvesGeometry::surface_uv_coords_for_write()
 {
-  return get_mutable_attribute<int>(*this, ATTR_DOMAIN_CURVE, ATTR_SURFACE_TRIANGLE_INDEX, -1);
+  return get_mutable_attribute<float2>(*this, ATTR_DOMAIN_CURVE, ATTR_SURFACE_UV_COORDINATE);
 }
 
-Span<float2> CurvesGeometry::surface_triangle_coords() const
+VArray<float> CurvesGeometry::selection_point_float() const
 {
-  return get_span_attribute<float2>(*this, ATTR_DOMAIN_CURVE, ATTR_SURFACE_TRIANGLE_COORDINATE);
+  return get_varray_attribute<float>(*this, ATTR_DOMAIN_POINT, ATTR_SELECTION_POINT_FLOAT, 1.0f);
 }
 
-MutableSpan<float2> CurvesGeometry::surface_triangle_coords_for_write()
+MutableSpan<float> CurvesGeometry::selection_point_float_for_write()
 {
-  return get_mutable_attribute<float2>(*this, ATTR_DOMAIN_CURVE, ATTR_SURFACE_TRIANGLE_COORDINATE);
+  return get_mutable_attribute<float>(*this, ATTR_DOMAIN_POINT, ATTR_SELECTION_POINT_FLOAT, 1.0f);
+}
+
+VArray<float> CurvesGeometry::selection_curve_float() const
+{
+  return get_varray_attribute<float>(*this, ATTR_DOMAIN_CURVE, ATTR_SELECTION_CURVE_FLOAT, 1.0f);
+}
+
+MutableSpan<float> CurvesGeometry::selection_curve_float_for_write()
+{
+  return get_mutable_attribute<float>(*this, ATTR_DOMAIN_CURVE, ATTR_SELECTION_CURVE_FLOAT, 1.0f);
 }
 
 /** \} */
@@ -462,8 +476,8 @@ static void calculate_evaluated_offsets(const CurvesGeometry &curves,
   VArray<int> resolution = curves.resolution();
   VArray<bool> cyclic = curves.cyclic();
 
-  VArray_Span<int8_t> handle_types_left{curves.handle_types_left()};
-  VArray_Span<int8_t> handle_types_right{curves.handle_types_right()};
+  VArraySpan<int8_t> handle_types_left{curves.handle_types_left()};
+  VArraySpan<int8_t> handle_types_right{curves.handle_types_right()};
 
   VArray<int8_t> nurbs_orders = curves.nurbs_orders();
   VArray<int8_t> nurbs_knots_modes = curves.nurbs_knots_modes();
@@ -540,16 +554,17 @@ IndexMask CurvesGeometry::indices_for_curve_type(const CurveType type,
                                                  const IndexMask selection,
                                                  Vector<int64_t> &r_indices) const
 {
-  if (this->curve_type_counts()[type] == this->curves_num()) {
-    return selection;
+  return curves::indices_for_type(
+      this->curve_types(), this->curve_type_counts(), type, selection, r_indices);
+}
+
+Array<int> CurvesGeometry::point_to_curve_map() const
+{
+  Array<int> map(this->points_num());
+  for (const int i : this->curves_range()) {
+    map.as_mutable_span().slice(this->points_for_curve(i)).fill(i);
   }
-  const VArray<int8_t> types = this->curve_types();
-  if (types.is_single()) {
-    return types.get_internal_single() == type ? IndexMask(this->curves_num()) : IndexMask(0);
-  }
-  Span<int8_t> types_span = types.get_internal_span();
-  return index_mask_ops::find_indices_based_on_predicate(
-      selection, 1024, r_indices, [&](const int index) { return types_span[index] == type; });
+  return map;
 }
 
 void CurvesGeometry::ensure_nurbs_basis_cache() const
@@ -717,8 +732,9 @@ Span<float3> CurvesGeometry::evaluated_tangents() const
       }
     });
 
-    /* Correct the first and last tangents of Bezier curves so that they align with the inner
-     * handles. This is a separate loop to avoid the cost when Bezier type curves are not used. */
+    /* Correct the first and last tangents of non-cyclic Bezier curves so that they align with the
+     * inner handles. This is a separate loop to avoid the cost when Bezier type curves are not
+     * used. */
     Vector<int64_t> bezier_indices;
     const IndexMask bezier_mask = this->indices_for_curve_type(CURVE_TYPE_BEZIER, bezier_indices);
     if (!bezier_mask.is_empty()) {
@@ -728,14 +744,20 @@ Span<float3> CurvesGeometry::evaluated_tangents() const
 
       threading::parallel_for(bezier_mask.index_range(), 1024, [&](IndexRange range) {
         for (const int curve_index : bezier_mask.slice(range)) {
+          if (cyclic[curve_index]) {
+            continue;
+          }
           const IndexRange points = this->points_for_curve(curve_index);
           const IndexRange evaluated_points = this->evaluated_points_for_curve(curve_index);
 
-          if (handles_right[points.first()] != positions[points.first()]) {
+          const float epsilon = 1e-6f;
+          if (!math::almost_equal_relative(
+                  handles_right[points.first()], positions[points.first()], epsilon)) {
             tangents[evaluated_points.first()] = math::normalize(handles_right[points.first()] -
                                                                  positions[points.first()]);
           }
-          if (handles_left[points.last()] != positions[points.last()]) {
+          if (!math::almost_equal_relative(
+                  handles_left[points.last()], positions[points.last()], epsilon)) {
             tangents[evaluated_points.last()] = math::normalize(positions[points.last()] -
                                                                 handles_left[points.last()]);
           }
@@ -936,6 +958,12 @@ void CurvesGeometry::ensure_evaluated_lengths() const
   this->runtime->length_cache_dirty = false;
 }
 
+void CurvesGeometry::ensure_can_interpolate_to_evaluated() const
+{
+  this->ensure_evaluated_offsets();
+  this->ensure_nurbs_basis_cache();
+}
+
 /** \} */
 
 /* -------------------------------------------------------------------- */
@@ -945,16 +973,15 @@ void CurvesGeometry::ensure_evaluated_lengths() const
 void CurvesGeometry::resize(const int points_num, const int curves_num)
 {
   if (points_num != this->point_num) {
-    CustomData_realloc(&this->point_data, points_num);
+    CustomData_realloc(&this->point_data, this->points_num(), points_num);
     this->point_num = points_num;
   }
   if (curves_num != this->curve_num) {
-    CustomData_realloc(&this->curve_data, curves_num);
+    CustomData_realloc(&this->curve_data, this->curves_num(), curves_num);
     this->curve_num = curves_num;
     this->curve_offsets = (int *)MEM_reallocN(this->curve_offsets, sizeof(int) * (curves_num + 1));
   }
   this->tag_topology_changed();
-  this->update_customdata_pointers();
 }
 
 void CurvesGeometry::tag_positions_changed()
@@ -1006,8 +1033,8 @@ void CurvesGeometry::calculate_bezier_auto_handles()
     return;
   }
   const VArray<bool> cyclic = this->cyclic();
-  const VArray_Span<int8_t> types_left{this->handle_types_left()};
-  const VArray_Span<int8_t> types_right{this->handle_types_right()};
+  const VArraySpan<int8_t> types_left{this->handle_types_left()};
+  const VArraySpan<int8_t> types_right{this->handle_types_right()};
   const Span<float3> positions = this->positions();
   MutableSpan<float3> positions_left = this->handle_positions_left_for_write();
   MutableSpan<float3> positions_right = this->handle_positions_right_for_write();
@@ -1053,10 +1080,11 @@ void CurvesGeometry::transform(const float4x4 &matrix)
 
 static std::optional<bounds::MinMaxResult<float3>> curves_bounds(const CurvesGeometry &curves)
 {
-  Span<float3> positions = curves.positions();
-  if (curves.radius) {
-    Span<float> radii{curves.radius, curves.points_num()};
-    return bounds::min_max_with_radii(positions, radii);
+  const Span<float3> positions = curves.positions();
+  const VArray<float> radii = curves.attributes().lookup_or_default<float>(
+      ATTR_RADIUS, ATTR_DOMAIN_POINT, 0.0f);
+  if (!(radii.is_single() && radii.get_internal_single() == 0.0f)) {
+    return bounds::min_max_with_radii(positions, radii.get_internal_span());
   }
   return bounds::min_max(positions);
 }
@@ -1072,29 +1100,146 @@ bool CurvesGeometry::bounds_min_max(float3 &min, float3 &max) const
   return true;
 }
 
-void CurvesGeometry::update_customdata_pointers()
+static void copy_between_buffers(const CPPType &type,
+                                 const void *src_buffer,
+                                 void *dst_buffer,
+                                 const IndexRange src_range,
+                                 const IndexRange dst_range)
 {
-  this->position = (float(*)[3])CustomData_get_layer_named(
-      &this->point_data, CD_PROP_FLOAT3, ATTR_POSITION.c_str());
-  this->radius = (float *)CustomData_get_layer_named(
-      &this->point_data, CD_PROP_FLOAT, ATTR_RADIUS.c_str());
-  this->curve_type = (int8_t *)CustomData_get_layer_named(
-      &this->point_data, CD_PROP_INT8, ATTR_CURVE_TYPE.c_str());
+  BLI_assert(src_range.size() == dst_range.size());
+  type.copy_construct_n(POINTER_OFFSET(src_buffer, type.size() * src_range.start()),
+                        POINTER_OFFSET(dst_buffer, type.size() * dst_range.start()),
+                        src_range.size());
 }
 
-static void *ensure_customdata_layer(CustomData &custom_data,
-                                     const StringRefNull name,
-                                     const CustomDataType data_type,
-                                     const int tot_elements)
+static void copy_with_map(const GSpan src, const Span<int> map, GMutableSpan dst)
 {
-  for (const int other_layer_i : IndexRange(custom_data.totlayer)) {
-    CustomDataLayer &new_layer = custom_data.layers[other_layer_i];
-    if (name == StringRef(new_layer.name)) {
-      return new_layer.data;
+  attribute_math::convert_to_static_type(src.type(), [&](auto dummy) {
+    using T = decltype(dummy);
+    array_utils::gather(src.typed<T>(), map, dst.typed<T>());
+  });
+}
+
+/**
+ * Builds an array that for every point, contains the corresponding curve index.
+ */
+static Array<int> build_point_to_curve_map(const CurvesGeometry &curves)
+{
+  Array<int> point_to_curve_map(curves.points_num());
+  threading::parallel_for(curves.curves_range(), 1024, [&](const IndexRange curves_range) {
+    for (const int i_curve : curves_range) {
+      point_to_curve_map.as_mutable_span().slice(curves.points_for_curve(i_curve)).fill(i_curve);
+    }
+  });
+  return point_to_curve_map;
+}
+
+static CurvesGeometry copy_with_removed_points(const CurvesGeometry &curves,
+                                               const IndexMask points_to_delete)
+{
+  /* Use a map from points to curves to facilitate using an #IndexMask input. */
+  const Array<int> point_to_curve_map = build_point_to_curve_map(curves);
+
+  const Vector<IndexRange> copy_point_ranges = points_to_delete.extract_ranges_invert(
+      curves.points_range());
+
+  /* For every range of points to copy, find the offset in the result curves point layers. */
+  int new_point_count = 0;
+  Array<int> copy_point_range_dst_offsets(copy_point_ranges.size());
+  for (const int i : copy_point_ranges.index_range()) {
+    copy_point_range_dst_offsets[i] = new_point_count;
+    new_point_count += copy_point_ranges[i].size();
+  }
+  BLI_assert(new_point_count == (curves.points_num() - points_to_delete.size()));
+
+  /* Find out how many non-deleted points there are in every curve. */
+  Array<int> curve_point_counts(curves.curves_num(), 0);
+  for (const IndexRange range : copy_point_ranges) {
+    for (const int point_i : range) {
+      curve_point_counts[point_to_curve_map[point_i]]++;
     }
   }
-  return CustomData_add_layer_named(
-      &custom_data, data_type, CD_DEFAULT, nullptr, tot_elements, name.c_str());
+
+  /* Build the offsets for the new curve points, skipping curves that had all points deleted.
+   * Also store the original indices of the corresponding input curves, to facilitate parallel
+   * copying of curve domain data. */
+  int new_curve_count = 0;
+  int curve_point_offset = 0;
+  Vector<int> new_curve_offsets;
+  Vector<int> new_curve_orig_indices;
+  new_curve_offsets.append(0);
+  for (const int i : curve_point_counts.index_range()) {
+    if (curve_point_counts[i] > 0) {
+      curve_point_offset += curve_point_counts[i];
+      new_curve_offsets.append(curve_point_offset);
+
+      new_curve_count++;
+      new_curve_orig_indices.append(i);
+    }
+  }
+
+  CurvesGeometry new_curves{new_point_count, new_curve_count};
+  Vector<bke::AttributeTransferData> point_attributes = bke::retrieve_attributes_for_transfer(
+      curves.attributes(), new_curves.attributes_for_write(), ATTR_DOMAIN_MASK_POINT);
+  Vector<bke::AttributeTransferData> curve_attributes = bke::retrieve_attributes_for_transfer(
+      curves.attributes(), new_curves.attributes_for_write(), ATTR_DOMAIN_MASK_CURVE);
+
+  threading::parallel_invoke(
+      256 < new_point_count * new_curve_count,
+      /* Initialize curve offsets. */
+      [&]() { new_curves.offsets_for_write().copy_from(new_curve_offsets); },
+      [&]() {
+        /* Copy over point attributes. */
+        for (bke::AttributeTransferData &attribute : point_attributes) {
+          threading::parallel_for(copy_point_ranges.index_range(), 128, [&](IndexRange range) {
+            for (const int range_i : range) {
+              const IndexRange src_range = copy_point_ranges[range_i];
+              copy_between_buffers(attribute.src.type(),
+                                   attribute.src.data(),
+                                   attribute.dst.span.data(),
+                                   src_range,
+                                   {copy_point_range_dst_offsets[range_i], src_range.size()});
+            }
+          });
+        }
+      },
+      [&]() {
+        /* Copy over curve attributes.
+         * In some cases points are just dissolved, so the number of
+         * curves will be the same. That could be optimized in the future. */
+        for (bke::AttributeTransferData &attribute : curve_attributes) {
+          if (new_curves.curves_num() == curves.curves_num()) {
+            attribute.dst.span.copy_from(attribute.src);
+          }
+          else {
+            copy_with_map(attribute.src, new_curve_orig_indices, attribute.dst.span);
+          }
+        }
+      });
+
+  for (bke::AttributeTransferData &attribute : point_attributes) {
+    attribute.dst.finish();
+  }
+  for (bke::AttributeTransferData &attribute : curve_attributes) {
+    attribute.dst.finish();
+  }
+
+  if (new_curves.curves_num() != curves.curves_num()) {
+    new_curves.remove_attributes_based_on_types();
+  }
+
+  return new_curves;
+}
+
+void CurvesGeometry::remove_points(const IndexMask points_to_delete)
+{
+  if (points_to_delete.is_empty()) {
+    return;
+  }
+  if (points_to_delete.size() == this->points_num()) {
+    *this = {};
+  }
+  *this = copy_with_removed_points(*this, points_to_delete);
 }
 
 static CurvesGeometry copy_with_removed_curves(const CurvesGeometry &curves,
@@ -1119,8 +1264,13 @@ static CurvesGeometry copy_with_removed_curves(const CurvesGeometry &curves,
   }
 
   CurvesGeometry new_curves{new_tot_points, new_tot_curves};
+  Vector<bke::AttributeTransferData> point_attributes = bke::retrieve_attributes_for_transfer(
+      curves.attributes(), new_curves.attributes_for_write(), ATTR_DOMAIN_MASK_POINT);
+  Vector<bke::AttributeTransferData> curve_attributes = bke::retrieve_attributes_for_transfer(
+      curves.attributes(), new_curves.attributes_for_write(), ATTR_DOMAIN_MASK_CURVE);
 
   threading::parallel_invoke(
+      256 < new_tot_points * new_tot_curves,
       /* Initialize curve offsets. */
       [&]() {
         MutableSpan<int> new_offsets = new_curves.offsets_for_write();
@@ -1147,68 +1297,56 @@ static CurvesGeometry copy_with_removed_curves(const CurvesGeometry &curves,
               }
             });
       },
-      /* Copy over point attributes. */
       [&]() {
-        const CustomData &old_point_data = curves.point_data;
-        CustomData &new_point_data = new_curves.point_data;
-        for (const int layer_i : IndexRange(old_point_data.totlayer)) {
-          const CustomDataLayer &old_layer = old_point_data.layers[layer_i];
-          const CustomDataType data_type = static_cast<CustomDataType>(old_layer.type);
-          const CPPType &type = *bke::custom_data_type_to_cpp_type(data_type);
-
-          const void *src_buffer = old_layer.data;
-          void *dst_buffer = ensure_customdata_layer(
-              new_point_data, old_layer.name, data_type, new_tot_points);
-
-          threading::parallel_for(
-              old_curve_ranges.index_range(), 128, [&](const IndexRange ranges_range) {
-                for (const int range_i : ranges_range) {
-                  const IndexRange old_point_range = old_point_ranges[range_i];
-                  const IndexRange new_point_range = new_point_ranges[range_i];
-
-                  type.copy_construct_n(
-                      POINTER_OFFSET(src_buffer, type.size() * old_point_range.start()),
-                      POINTER_OFFSET(dst_buffer, type.size() * new_point_range.start()),
-                      old_point_range.size());
-                }
-              });
+        /* Copy over point attributes. */
+        for (bke::AttributeTransferData &attribute : point_attributes) {
+          threading::parallel_for(old_curve_ranges.index_range(), 128, [&](IndexRange range) {
+            for (const int range_i : range) {
+              copy_between_buffers(attribute.src.type(),
+                                   attribute.src.data(),
+                                   attribute.dst.span.data(),
+                                   old_point_ranges[range_i],
+                                   new_point_ranges[range_i]);
+            }
+          });
         }
       },
-      /* Copy over curve attributes. */
       [&]() {
-        const CustomData &old_curve_data = curves.curve_data;
-        CustomData &new_curve_data = new_curves.curve_data;
-        for (const int layer_i : IndexRange(old_curve_data.totlayer)) {
-          const CustomDataLayer &old_layer = old_curve_data.layers[layer_i];
-          const CustomDataType data_type = static_cast<CustomDataType>(old_layer.type);
-          const CPPType &type = *bke::custom_data_type_to_cpp_type(data_type);
-
-          const void *src_buffer = old_layer.data;
-          void *dst_buffer = ensure_customdata_layer(
-              new_curve_data, old_layer.name, data_type, new_tot_points);
-
-          threading::parallel_for(
-              old_curve_ranges.index_range(), 128, [&](const IndexRange ranges_range) {
-                for (const int range_i : ranges_range) {
-                  const IndexRange old_curve_range = old_curve_ranges[range_i];
-                  const IndexRange new_curve_range = new_curve_ranges[range_i];
-
-                  type.copy_construct_n(
-                      POINTER_OFFSET(src_buffer, type.size() * old_curve_range.start()),
-                      POINTER_OFFSET(dst_buffer, type.size() * new_curve_range.start()),
-                      old_curve_range.size());
-                }
-              });
+        /* Copy over curve attributes. */
+        for (bke::AttributeTransferData &attribute : curve_attributes) {
+          threading::parallel_for(old_curve_ranges.index_range(), 128, [&](IndexRange range) {
+            for (const int range_i : range) {
+              copy_between_buffers(attribute.src.type(),
+                                   attribute.src.data(),
+                                   attribute.dst.span.data(),
+                                   old_curve_ranges[range_i],
+                                   new_curve_ranges[range_i]);
+            }
+          });
         }
       });
 
-  new_curves.update_curve_types();
+  for (bke::AttributeTransferData &attribute : point_attributes) {
+    attribute.dst.finish();
+  }
+  for (bke::AttributeTransferData &attribute : curve_attributes) {
+    attribute.dst.finish();
+  }
+
+  new_curves.remove_attributes_based_on_types();
 
   return new_curves;
 }
 
 void CurvesGeometry::remove_curves(const IndexMask curves_to_delete)
 {
+  if (curves_to_delete.is_empty()) {
+    return;
+  }
+  if (curves_to_delete.size() == this->curves_num()) {
+    *this = {};
+    return;
+  }
   *this = copy_with_removed_curves(*this, curves_to_delete);
 }
 
@@ -1240,76 +1378,82 @@ static void reverse_swap_curve_point_data(const CurvesGeometry &curves,
         std::swap(a[end_index], b[i]);
         std::swap(b[end_index], a[i]);
       }
+      if (points.size() % 2) {
+        const int64_t middle_index = points.size() / 2;
+        std::swap(a[middle_index], b[middle_index]);
+      }
     }
   });
 }
 
-static bool layer_matches_name_and_type(const CustomDataLayer &layer,
-                                        const StringRef name,
-                                        const CustomDataType type)
-{
-  if (layer.type != type) {
-    return false;
-  }
-  return layer.name == name;
-}
-
 void CurvesGeometry::reverse_curves(const IndexMask curves_to_reverse)
 {
-  CustomData_duplicate_referenced_layers(&this->point_data, this->points_num());
+  Set<StringRef> bezier_handle_names{{ATTR_HANDLE_POSITION_LEFT,
+                                      ATTR_HANDLE_POSITION_RIGHT,
+                                      ATTR_HANDLE_TYPE_LEFT,
+                                      ATTR_HANDLE_TYPE_RIGHT}};
 
-  /* Collect the Bezier handle attributes while iterating through the point custom data layers;
-   * they need special treatment later. */
-  MutableSpan<float3> positions_left;
-  MutableSpan<float3> positions_right;
-  MutableSpan<int8_t> types_left;
-  MutableSpan<int8_t> types_right;
+  MutableAttributeAccessor attributes = this->attributes_for_write();
 
-  for (const int layer_i : IndexRange(this->point_data.totlayer)) {
-    CustomDataLayer &layer = this->point_data.layers[layer_i];
-
-    if (positions_left.is_empty() &&
-        layer_matches_name_and_type(layer, ATTR_HANDLE_POSITION_LEFT, CD_PROP_FLOAT3)) {
-      positions_left = {static_cast<float3 *>(layer.data), this->points_num()};
-      continue;
+  attributes.for_all([&](const AttributeIDRef &id, AttributeMetaData meta_data) {
+    if (meta_data.domain != ATTR_DOMAIN_POINT) {
+      return true;
     }
-    if (positions_right.is_empty() &&
-        layer_matches_name_and_type(layer, ATTR_HANDLE_POSITION_RIGHT, CD_PROP_FLOAT3)) {
-      positions_right = {static_cast<float3 *>(layer.data), this->points_num()};
-      continue;
+    if (meta_data.data_type == CD_PROP_STRING) {
+      return true;
     }
-    if (types_left.is_empty() &&
-        layer_matches_name_and_type(layer, ATTR_HANDLE_TYPE_LEFT, CD_PROP_INT8)) {
-      types_left = {static_cast<int8_t *>(layer.data), this->points_num()};
-      continue;
-    }
-    if (types_right.is_empty() &&
-        layer_matches_name_and_type(layer, ATTR_HANDLE_TYPE_RIGHT, CD_PROP_INT8)) {
-      types_right = {static_cast<int8_t *>(layer.data), this->points_num()};
-      continue;
+    if (id.is_named() && bezier_handle_names.contains(id.name())) {
+      return true;
     }
 
-    const CustomDataType data_type = static_cast<CustomDataType>(layer.type);
-    attribute_math::convert_to_static_type(data_type, [&](auto dummy) {
+    GSpanAttributeWriter attribute = attributes.lookup_for_write_span(id);
+    attribute_math::convert_to_static_type(attribute.span.type(), [&](auto dummy) {
       using T = decltype(dummy);
-      reverse_curve_point_data<T>(
-          *this, curves_to_reverse, {static_cast<T *>(layer.data), this->points_num()});
+      reverse_curve_point_data<T>(*this, curves_to_reverse, attribute.span.typed<T>());
     });
-  }
+    attribute.finish();
+    return true;
+  });
 
   /* In order to maintain the shape of Bezier curves, handle attributes must reverse, but also the
    * values for the left and right must swap. Use a utility to swap and reverse at the same time,
    * to avoid loading the attribute twice. Generally we can expect the right layer to exist when
    * the left does, but there's no need to count on it, so check for both attributes. */
 
-  if (!positions_left.is_empty() && !positions_right.is_empty()) {
-    reverse_swap_curve_point_data(*this, curves_to_reverse, positions_left, positions_right);
+  if (attributes.contains(ATTR_HANDLE_POSITION_LEFT) &&
+      attributes.contains(ATTR_HANDLE_POSITION_RIGHT)) {
+    reverse_swap_curve_point_data(*this,
+                                  curves_to_reverse,
+                                  this->handle_positions_left_for_write(),
+                                  this->handle_positions_right_for_write());
   }
-  if (!types_left.is_empty() && !types_right.is_empty()) {
-    reverse_swap_curve_point_data(*this, curves_to_reverse, types_left, types_right);
+  if (attributes.contains(ATTR_HANDLE_TYPE_LEFT) && attributes.contains(ATTR_HANDLE_TYPE_RIGHT)) {
+    reverse_swap_curve_point_data(*this,
+                                  curves_to_reverse,
+                                  this->handle_types_left_for_write(),
+                                  this->handle_types_right_for_write());
   }
 
   this->tag_topology_changed();
+}
+
+void CurvesGeometry::remove_attributes_based_on_types()
+{
+  MutableAttributeAccessor attributes = this->attributes_for_write();
+  if (!this->has_curve_with_type(CURVE_TYPE_BEZIER)) {
+    attributes.remove(ATTR_HANDLE_TYPE_LEFT);
+    attributes.remove(ATTR_HANDLE_TYPE_RIGHT);
+    attributes.remove(ATTR_HANDLE_POSITION_LEFT);
+    attributes.remove(ATTR_HANDLE_POSITION_RIGHT);
+  }
+  if (!this->has_curve_with_type(CURVE_TYPE_NURBS)) {
+    attributes.remove(ATTR_NURBS_WEIGHT);
+    attributes.remove(ATTR_NURBS_ORDER);
+    attributes.remove(ATTR_NURBS_KNOTS_MODE);
+  }
+  if (!this->has_curve_with_type({CURVE_TYPE_BEZIER, CURVE_TYPE_CATMULL_ROM, CURVE_TYPE_NURBS})) {
+    attributes.remove(ATTR_RESOLUTION);
+  }
 }
 
 /** \} */
@@ -1331,12 +1475,15 @@ static void adapt_curve_domain_point_to_curve_impl(const CurvesGeometry &curves,
                                                    MutableSpan<T> r_values)
 {
   attribute_math::DefaultMixer<T> mixer(r_values);
-  for (const int i_curve : IndexRange(curves.curves_num())) {
-    for (const int i_point : curves.points_for_curve(i_curve)) {
-      mixer.mix_in(i_curve, old_values[i_point]);
+
+  threading::parallel_for(curves.curves_range(), 128, [&](const IndexRange range) {
+    for (const int i_curve : range) {
+      for (const int i_point : curves.points_for_curve(i_curve)) {
+        mixer.mix_in(i_curve, old_values[i_point]);
+      }
     }
-  }
-  mixer.finalize();
+    mixer.finalize(range);
+  });
 }
 
 /**
@@ -1408,8 +1555,8 @@ static GVArray adapt_curve_domain_curve_to_point(const CurvesGeometry &curves,
 }
 
 GVArray CurvesGeometry::adapt_domain(const GVArray &varray,
-                                     const AttributeDomain from,
-                                     const AttributeDomain to) const
+                                     const eAttrDomain from,
+                                     const eAttrDomain to) const
 {
   if (!varray) {
     return {};
@@ -1419,6 +1566,11 @@ GVArray CurvesGeometry::adapt_domain(const GVArray &varray,
   }
   if (from == to) {
     return varray;
+  }
+  if (varray.is_single()) {
+    BUFFER_FOR_CPP_TYPE_VALUE(varray.type(), value);
+    varray.get_internal_single(value);
+    return GVArray::ForSingle(varray.type(), this->attributes().domain_size(to), value);
   }
 
   if (from == ATTR_DOMAIN_POINT && to == ATTR_DOMAIN_CURVE) {

@@ -1,7 +1,5 @@
 # SPDX-License-Identifier: GPL-2.0-or-later
 
-# <pep8 compliant>
-
 import enchant
 import os
 import pickle
@@ -391,6 +389,8 @@ class SpellChecker:
         "albedo",
         "anamorphic",
         "anisotropic", "anisotropy",
+        "arcminute", "arcminutes",
+        "arcsecond", "arcseconds",
         "bimanual",  # OpenXR?
         "bitangent",
         "boid", "boids",
@@ -435,6 +435,7 @@ class SpellChecker:
         "polyline", "polylines",
         "probabilistically",
         "pulldown", "pulldowns",
+        "quadratically",
         "quantized",
         "quartic",
         "quaternion", "quaternions",
@@ -450,7 +451,7 @@ class SpellChecker:
         "superellipse",
         "thumbstick",
         "tooltip", "tooltips",
-        "trackpad",
+        "touchpad", "trackpad",
         "tuple",
         "unicode",
         "viewport", "viewports",
@@ -503,6 +504,7 @@ class SpellChecker:
         "luminance",
         "mantaflow",
         "matcap",
+        "microfacet",
         "midtones",
         "mipmap", "mipmaps", "mip",
         "ngon", "ngons",
@@ -510,6 +512,7 @@ class SpellChecker:
         "nurb", "nurbs",
         "perlin",
         "phong",
+        "photorealistic",
         "pinlight",
         "posterize",
         "qi",
@@ -532,6 +535,7 @@ class SpellChecker:
         "tonemap",
         "toon",
         "transmissive",
+        "uvproject",
         "vividlight",
         "volumetrics",
         "voronoi",
@@ -648,6 +652,7 @@ class SpellChecker:
         "mikktspace",
         "minkowski",
         "minnaert",
+        "mises",  # von Mises-Fisher
         "moskowitz",  # Pierson-Moskowitz
         "musgrave",
         "nayar",
@@ -663,6 +668,7 @@ class SpellChecker:
         "runge",
         "sobol",
         "verlet",
+        "von",  # von Mises-Fisher
         "wilkie",
         "worley",
 
@@ -677,7 +683,7 @@ class SpellChecker:
         "ascii",
         "atrac",
         "avx",
-        "bsdf",
+        "bsdf", "bsdfs",
         "bssrdf",
         "bw",
         "ccd",
@@ -710,15 +716,19 @@ class SpellChecker:
         "hdc",
         "hdr", "hdri", "hdris",
         "hh", "mm", "ss", "ff",  # hh:mm:ss:ff timecode
+        "hpg",  # Intel Xe-HPG architecture
         "hsv", "hsva", "hsl",
         "id",
         "ies",
         "ior",
         "itu",
         "jonswap",
+        "lfe",
         "lhs",
         "lmb", "mmb", "rmb",
+        "lscm",
         "kb",
+        "mis",
         "mocap",
         "msgid", "msgids",
         "mux",
@@ -745,6 +755,8 @@ class SpellChecker:
         "unix",
         "uuid",
         "vbo", "vbos",
+        "vfx",
+        "vmm",
         "vr",
         "wxyz",
         "xr",

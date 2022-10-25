@@ -22,12 +22,12 @@ static void node_declare(NodeDeclarationBuilder &b)
   b.add_output<decl::Int>(N_("Attribute"), "Attribute_Int").field_source();
 }
 
-static void node_layout(uiLayout *layout, bContext *UNUSED(C), PointerRNA *ptr)
+static void node_layout(uiLayout *layout, bContext * /*C*/, PointerRNA *ptr)
 {
   uiItemR(layout, ptr, "data_type", 0, "", ICON_NONE);
 }
 
-static void node_init(bNodeTree *UNUSED(tree), bNode *node)
+static void node_init(bNodeTree * /*tree*/, bNode *node)
 {
   NodeGeometryInputNamedAttribute *data = MEM_cnew<NodeGeometryInputNamedAttribute>(__func__);
   data->data_type = CD_PROP_FLOAT;
@@ -37,9 +37,9 @@ static void node_init(bNodeTree *UNUSED(tree), bNode *node)
 static void node_update(bNodeTree *ntree, bNode *node)
 {
   const NodeGeometryInputNamedAttribute &storage = node_storage(*node);
-  const CustomDataType data_type = static_cast<CustomDataType>(storage.data_type);
+  const eCustomDataType data_type = eCustomDataType(storage.data_type);
 
-  bNodeSocket *socket_vector = (bNodeSocket *)node->outputs.first;
+  bNodeSocket *socket_vector = static_cast<bNodeSocket *>(node->outputs.first);
   bNodeSocket *socket_float = socket_vector->next;
   bNodeSocket *socket_color4f = socket_float->next;
   bNodeSocket *socket_boolean = socket_color4f->next;
@@ -58,8 +58,8 @@ static void node_gather_link_searches(GatherLinkSearchOpParams &params)
   search_link_ops_for_declarations(params, declaration.inputs());
 
   if (params.in_out() == SOCK_OUT) {
-    const std::optional<CustomDataType> type = node_data_type_to_custom_data_type(
-        static_cast<eNodeSocketDatatype>(params.other_socket().type));
+    const std::optional<eCustomDataType> type = node_data_type_to_custom_data_type(
+        eNodeSocketDatatype(params.other_socket().type));
     if (type && *type != CD_PROP_STRING) {
       /* The input and output sockets have the same name. */
       params.add_item(IFACE_("Attribute"), [type](LinkSearchOpParams &params) {
@@ -74,11 +74,16 @@ static void node_gather_link_searches(GatherLinkSearchOpParams &params)
 static void node_geo_exec(GeoNodeExecParams params)
 {
   const NodeGeometryInputNamedAttribute &storage = node_storage(params.node());
-  const CustomDataType data_type = static_cast<CustomDataType>(storage.data_type);
+  const eCustomDataType data_type = eCustomDataType(storage.data_type);
 
   const std::string name = params.extract_input<std::string>("Name");
 
   if (name.empty()) {
+    params.set_default_remaining_outputs();
+    return;
+  }
+  if (!bke::allow_procedural_attribute_access(name)) {
+    params.error_message_add(NodeWarningType::Info, TIP_(bke::no_procedural_access_message));
     params.set_default_remaining_outputs();
     return;
   }

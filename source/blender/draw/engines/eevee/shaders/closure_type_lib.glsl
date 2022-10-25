@@ -6,8 +6,8 @@
 
 #ifndef VOLUMETRICS
 
-uniform int outputSsrId; /*Default = 1;*/
-uniform int outputSssId; /*Default = 1;*/
+uniform int outputSsrId; /* Default = 1; */
+uniform int outputSssId; /* Default = 1; */
 
 #endif
 
@@ -24,7 +24,7 @@ struct Closure {
   float holdout;
 #endif
 
-/* Metal Default Constructor - Requred for C++ constructor syntax. */
+/* Metal Default Constructor - Required for C++ constructor syntax. */
 #ifdef GPU_METAL
   inline Closure() = default;
 #  ifdef VOLUMETRICS
